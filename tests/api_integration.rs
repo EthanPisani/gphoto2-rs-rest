@@ -6,11 +6,13 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use nikon_bulb_server::build_router;
 use nikon_bulb_server::camera::CameraBackend;
+use nikon_bulb_server::capture_store::CaptureStore;
 use nikon_bulb_server::config::AppConfig;
 use nikon_bulb_server::error::ApiError;
 use nikon_bulb_server::models::{CaptureRequest, CaptureResponse};
 use nikon_bulb_server::state::AppState;
 use tower::util::ServiceExt;
+use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
 struct MockBackend {
@@ -52,7 +54,11 @@ impl CameraBackend for MockBackend {
 fn app_with_mode(mode: MockMode) -> axum::Router {
     let backend: Arc<dyn CameraBackend> = Arc::new(MockBackend { mode });
     let config = AppConfig::from_env();
-    let state = AppState { backend, config };
+    let state = AppState {
+        backend,
+        capture_store: CaptureStore::new(),
+        config,
+    };
     build_router(state)
 }
 
@@ -69,11 +75,12 @@ async fn capture_success_returns_200() {
         .unwrap();
 
     let response = app.oneshot(req).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
 
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["camera_model"], "MockCam");
+    assert_eq!(json["status"], "queued");
+    assert!(json["capture_id"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -93,9 +100,9 @@ async fn capture_validation_returns_400() {
 }
 
 #[tokio::test]
-async fn capture_usb_error_maps_to_503() {
+async fn capture_usb_error_transitions_to_failed() {
     let app = app_with_mode(MockMode::Usb);
-    let req = Request::builder()
+    let create_req = Request::builder()
         .method("POST")
         .uri("/api/v1/captures")
         .header("content-type", "application/json")
@@ -104,8 +111,26 @@ async fn capture_usb_error_maps_to_503() {
         ))
         .unwrap();
 
-    let response = app.oneshot(req).await.unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let accepted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let capture_id = accepted["capture_id"].as_str().unwrap();
+
+    sleep(Duration::from_millis(20)).await;
+
+    let status_req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/captures/{capture_id}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let status_response = app.oneshot(status_req).await.unwrap();
+    assert_eq!(status_response.status(), StatusCode::OK);
+    let status_bytes = status_response.into_body().collect().await.unwrap().to_bytes();
+    let status_json: serde_json::Value = serde_json::from_slice(&status_bytes).unwrap();
+    assert_eq!(status_json["status"], "failed");
 }
 
 #[tokio::test]

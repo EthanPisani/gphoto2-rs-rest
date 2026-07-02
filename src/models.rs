@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CaptureRequest {
     #[schema(example = 800)]
     pub iso: Option<String>,
@@ -33,6 +33,54 @@ pub struct CaptureResponse {
     pub source_name: String,
     pub captured_at: DateTime<Utc>,
     pub attempt_count: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStatus {
+    Queued,
+    Capturing,
+    Downloading,
+    Complete,
+    Failed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CaptureAccepted {
+    pub capture_id: String,
+    pub status: CaptureStatus,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CaptureRecord {
+    pub id: String,
+    pub status: CaptureStatus,
+    pub request_json: String,
+    pub camera_model: Option<String>,
+    pub saved_path: Option<String>,
+    pub source_folder: Option<String>,
+    pub source_name: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub checksum: Option<String>,
+    pub error: Option<String>,
+    pub attempt_count: u8,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub downloaded_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CaptureListResponse {
+    pub items: Vec<CaptureRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ListCapturesQuery {
+    pub status: Option<CaptureStatus>,
+    pub limit: Option<usize>,
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]

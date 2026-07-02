@@ -100,6 +100,8 @@ async fn capture_with_fallbacks(
 fn format_api_error(err: ApiError) -> String {
     match err {
         ApiError::Validation(m) => format!("validation: {m}"),
+        ApiError::NotFound(m) => format!("not found: {m}"),
+        ApiError::Conflict(m) => format!("conflict: {m}"),
         ApiError::CameraUnavailable => "camera unavailable".to_string(),
         ApiError::Usb(m) => format!("usb: {m}"),
         ApiError::CaptureFailed(m) => format!("capture failed: {m}"),

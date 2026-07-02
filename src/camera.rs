@@ -1,11 +1,11 @@
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use gphoto2::widget::Widget;
 use gphoto2::{Camera, Context};
+use tokio::sync::Mutex;
 use tokio::task;
 use uuid::Uuid;
 
@@ -24,6 +24,7 @@ pub struct GphotoBackend {
     pub capture_dir: PathBuf,
     pub event_timeout: Duration,
     pub retries: u8,
+    camera_lock: std::sync::Arc<Mutex<()>>,
 }
 
 impl GphotoBackend {
@@ -32,6 +33,7 @@ impl GphotoBackend {
             capture_dir,
             event_timeout,
             retries,
+            camera_lock: std::sync::Arc::new(Mutex::new(())),
         }
     }
 }
@@ -39,6 +41,12 @@ impl GphotoBackend {
 #[async_trait]
 impl CameraBackend for GphotoBackend {
     async fn capture(&self, request: CaptureRequest) -> Result<CaptureResponse, ApiError> {
+        let _camera_guard = self
+            .camera_lock
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| ApiError::Conflict("camera is busy with another operation".to_string()))?;
+
         let max_attempts = self.retries.saturating_add(1);
         let mut last_error: Option<ApiError> = None;
 
@@ -71,6 +79,7 @@ impl CameraBackend for GphotoBackend {
     }
 
     async fn camera_model(&self) -> Result<Option<String>, ApiError> {
+        let _camera_guard = self.camera_lock.clone().lock_owned().await;
         let result = task::spawn_blocking(move || {
             let context = Context::new().map_err(|e| ApiError::Usb(e.to_string()))?;
             let camera = context
@@ -131,22 +140,16 @@ fn capture_once(
             ApiError::Validation("exposure_seconds is required for bulb mode".to_string())
         })?;
 
-        // Fix 1: remove the silent 30s default — make it required or use a sane large default
-        let exposure_seconds = request.exposure_seconds.ok_or_else(|| {
-            ApiError::Validation("exposure_seconds is required for bulb mode".to_string())
-        })?;
+        let bulb_wait_deadline = event_timeout.max(Duration::from_secs(
+            (2 * exposure_seconds + 20).max(30),
+        ));
 
-        let extension = extension_from_image_format(request.image_format.as_deref());
-        let output_file_name = format!("{capture_id}.{extension}");
-        let output_path = capture_dir.join(&output_file_name);
-
-        // Fix 2: use the native libgphoto2 path, not the CLI
         let output_path = capture_bulb_native(
             &camera,
             &capture_dir,
             exposure_seconds,
             &capture_id,
-            request.image_format.as_deref(),
+            bulb_wait_deadline,
         )?;
 
         return Ok(CaptureResponse {
@@ -221,7 +224,7 @@ fn capture_bulb_native(
     capture_dir: &std::path::Path,
     exposure_seconds: u64,
     capture_id: &str,
-    image_format: Option<&str>,
+    event_timeout: Duration,
 ) -> Result<std::path::PathBuf, ApiError> {
     use gphoto2::camera::CameraEvent;
     use gphoto2::widget::Widget;
@@ -263,8 +266,9 @@ fn capture_bulb_native(
         let _ = camera.set_config(bulb_close).wait(); // intentionally ignore error — D5300 known bug
     }
 
-    // Drain events until we get a NewFile or CaptureComplete (up to 30s grace)
-    let deadline = Duration::from_secs(30);
+    // Drain events until we get a NewFile or CaptureComplete.
+    // For long bulb captures this timeout must scale with exposure time.
+    let deadline = event_timeout;
     let tick = Duration::from_millis(500);
     let mut elapsed = Duration::ZERO;
     let mut capture_path: Option<(String, String)> = None;
@@ -298,43 +302,6 @@ fn capture_bulb_native(
         .map_err(|e| ApiError::CaptureFailed(format!("download failed: {e}")))?;
 
     Ok(output_path)
-}
-fn capture_bulb_with_gphoto2_cli(
-    exposure_seconds: u64,
-    output_path: &std::path::Path,
-) -> Result<(), ApiError> {
-    let status = Command::new("gphoto2")
-        .arg("-B")
-        .arg(exposure_seconds.to_string())
-        .arg("--capture-image-and-download")
-        .arg("--force-overwrite")
-        .arg("--filename")
-        .arg(output_path.as_os_str())
-        .status()
-        .map_err(|e| ApiError::CaptureFailed(format!("failed to execute gphoto2: {e}")))?;
-
-    if !status.success() {
-        return Err(ApiError::CaptureFailed(format!(
-            "gphoto2 bulb capture failed with status: {status}"
-        )));
-    }
-
-    Ok(())
-}
-
-fn extension_from_image_format(image_format: Option<&str>) -> &'static str {
-    let Some(format) = image_format else {
-        return "jpg";
-    };
-
-    let normalized = format.to_ascii_lowercase();
-    if normalized.contains("raw") || normalized.contains("nef") {
-        "nef"
-    } else if normalized.contains("jpeg") || normalized.contains("jpg") {
-        "jpg"
-    } else {
-        "jpg"
-    }
 }
 
 fn set_camera_option(camera: &Camera, key: &str, value: &str) -> Result<(), ApiError> {

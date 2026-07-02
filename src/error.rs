@@ -10,6 +10,10 @@ use crate::models::ErrorResponse;
 pub enum ApiError {
     #[error("invalid request: {0}")]
     Validation(String),
+    #[error("resource not found: {0}")]
+    NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("camera not found or unavailable")]
     CameraUnavailable,
     #[error("usb communication failure: {0}")]
@@ -24,6 +28,8 @@ impl ApiError {
     fn code(&self) -> &'static str {
         match self {
             Self::Validation(_) => "VALIDATION_ERROR",
+            Self::NotFound(_) => "NOT_FOUND",
+            Self::Conflict(_) => "CONFLICT",
             Self::CameraUnavailable => "CAMERA_UNAVAILABLE",
             Self::Usb(_) => "USB_CONNECTION_LOST",
             Self::CaptureFailed(_) => "CAPTURE_FAILED",
@@ -34,6 +40,8 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             Self::Validation(_) => StatusCode::BAD_REQUEST,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::CameraUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Usb(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::CaptureFailed(_) => StatusCode::BAD_GATEWAY,

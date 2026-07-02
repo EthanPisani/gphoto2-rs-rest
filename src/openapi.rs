@@ -1,14 +1,20 @@
 use utoipa::OpenApi;
 
 use crate::models::{
-    CameraCapabilitiesResponse, CaptureRequest, CaptureResponse, ErrorResponse, HealthResponse,
-    RecoverResponse,
+    CameraCapabilitiesResponse, CaptureAccepted, CaptureListResponse, CaptureRecord,
+    CaptureRequest, CaptureStatus, ErrorResponse, HealthResponse, RecoverResponse,
 };
 
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        crate::handlers::capture_image,
+        crate::handlers::create_capture,
+        crate::handlers::get_capture,
+        crate::handlers::list_captures,
+        crate::handlers::get_capture_file,
+        crate::handlers::mark_downloaded,
+        crate::handlers::cancel_capture,
+        crate::handlers::delete_capture,
         crate::handlers::health,
         crate::handlers::recover_camera,
         crate::handlers::camera_capabilities
@@ -16,7 +22,10 @@ use crate::models::{
     components(
         schemas(
             CaptureRequest,
-            CaptureResponse,
+            CaptureAccepted,
+            CaptureRecord,
+            CaptureListResponse,
+            CaptureStatus,
             HealthResponse,
             RecoverResponse,
             CameraCapabilitiesResponse,
