@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod config;
+pub mod capture_control;
 pub mod capture_store;
 pub mod error;
 pub mod handlers;
@@ -8,15 +9,20 @@ pub mod openapi;
 pub mod state;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::routing::{get, post};
 use axum::Router;
+use tokio::time::interval;
 use tower_http::cors::CorsLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use tracing::{info, warn};
+
 use crate::camera::{CameraBackend, GphotoBackend};
+use crate::capture_control::CaptureControlStore;
 use crate::config::AppConfig;
 use crate::capture_store::CaptureStore;
 use crate::handlers::{
@@ -54,10 +60,57 @@ pub fn build_default_router(config: AppConfig) -> Router {
         std::time::Duration::from_secs(config.capture_event_timeout_secs),
         config.camera_retries,
     ));
+
+    let capture_store = CaptureStore::new(config.capture_db_path.clone())
+        .expect("failed to initialize capture database");
+
     let state = AppState {
         backend,
-        capture_store: CaptureStore::new(),
-        config,
+        capture_store,
+        capture_controls: CaptureControlStore::new(),
+        config: config.clone(),
     };
+
+    start_background_tasks(state.clone());
+
     build_router(state)
+}
+
+fn start_background_tasks(state: AppState) {
+    let startup_state = state.clone();
+    tokio::spawn(async move {
+        startup_state
+            .capture_store
+            .mark_inflight_as_failed("capture interrupted by service restart")
+            .await;
+    });
+
+    let retention_state = state.clone();
+    tokio::spawn(async move {
+        let every = Duration::from_secs(retention_state.config.retention_sweep_interval_secs.max(30));
+        let mut ticker = interval(every);
+        loop {
+            ticker.tick().await;
+            let deleted = retention_state
+                .capture_store
+                .sweep_downloaded_older_than(retention_state.config.downloaded_retention_secs)
+                .await;
+            if deleted > 0 {
+                info!(deleted, "retention sweep removed downloaded captures");
+            }
+        }
+    });
+
+    if state.config.keepalive_interval_secs > 0 {
+        let keepalive_state = state;
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(keepalive_state.config.keepalive_interval_secs));
+            loop {
+                ticker.tick().await;
+                if let Err(error) = keepalive_state.backend.camera_model().await {
+                    warn!(error = %error, "camera keepalive probe failed");
+                }
+            }
+        });
+    }
 }

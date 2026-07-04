@@ -105,6 +105,7 @@ fn format_api_error(err: ApiError) -> String {
         ApiError::CameraUnavailable => "camera unavailable".to_string(),
         ApiError::Usb(m) => format!("usb: {m}"),
         ApiError::CaptureFailed(m) => format!("capture failed: {m}"),
+        ApiError::InsufficientStorage(m) => format!("insufficient storage: {m}"),
         ApiError::Internal => "internal".to_string(),
     }
 }

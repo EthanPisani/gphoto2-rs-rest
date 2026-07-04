@@ -44,6 +44,11 @@ pub async fn create_capture(
         }
     }
 
+    ensure_storage_headroom(
+        &state.config.capture_dir,
+        state.config.min_free_space_bytes,
+    )?;
+
     let capture_id = Uuid::new_v4().to_string();
     let inserted = state
         .capture_store
@@ -55,15 +60,28 @@ pub async fn create_capture(
         ));
     }
 
+    let cancel_token = state.capture_controls.register(&capture_id).await;
+
     let state_for_task = state.clone();
     let capture_id_for_task = capture_id.clone();
     tokio::spawn(async move {
+        if let Some(existing) = state_for_task.capture_store.get(&capture_id_for_task).await {
+            if existing.status == CaptureStatus::Canceled {
+                state_for_task.capture_controls.remove(&capture_id_for_task).await;
+                return;
+            }
+        }
+
         state_for_task
             .capture_store
             .set_status(&capture_id_for_task, CaptureStatus::Capturing)
             .await;
 
-        match state_for_task.backend.capture(request).await {
+        match state_for_task
+            .backend
+            .capture_with_cancel(request, cancel_token)
+            .await
+        {
             Ok(response) => {
                 state_for_task
                     .capture_store
@@ -75,12 +93,24 @@ pub async fn create_capture(
                     .await;
             }
             Err(error) => {
-                state_for_task
-                    .capture_store
-                    .set_failed(&capture_id_for_task, error.to_string())
-                    .await;
+                match error {
+                    ApiError::Conflict(message) if message.contains("canceled") => {
+                        state_for_task
+                            .capture_store
+                            .set_canceled(&capture_id_for_task)
+                            .await;
+                    }
+                    _ => {
+                        state_for_task
+                            .capture_store
+                            .set_failed(&capture_id_for_task, error.to_string())
+                            .await;
+                    }
+                }
             }
         }
+
+        state_for_task.capture_controls.remove(&capture_id_for_task).await;
     });
 
     Ok((
@@ -181,6 +211,7 @@ pub async fn cancel_capture(
         return Err(ApiError::NotFound(format!("capture '{id}' not found")));
     }
 
+    let _ = state.capture_controls.cancel(&id).await;
     state.capture_store.set_canceled(&id).await;
     let record = state
         .capture_store
@@ -188,6 +219,23 @@ pub async fn cancel_capture(
         .await
         .ok_or_else(|| ApiError::NotFound(format!("capture '{id}' not found")))?;
     Ok(Json(record))
+}
+
+fn ensure_storage_headroom(capture_dir: &std::path::Path, min_free_bytes: u64) -> Result<(), ApiError> {
+    std::fs::create_dir_all(capture_dir)
+        .map_err(|e| ApiError::CaptureFailed(format!("unable to create capture directory: {e}")))?;
+
+    let available = fs2::available_space(capture_dir)
+        .map_err(|e| ApiError::CaptureFailed(format!("unable to check free space: {e}")))?;
+
+    if available < min_free_bytes {
+        return Err(ApiError::InsufficientStorage(format!(
+            "free space {} bytes is below configured minimum {} bytes",
+            available, min_free_bytes
+        )));
+    }
+
+    Ok(())
 }
 
 #[utoipa::path(

@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,6 +16,12 @@ use crate::models::{CaptureRequest, CaptureResponse};
 
 #[async_trait]
 pub trait CameraBackend: Send + Sync {
+    async fn capture_with_cancel(
+        &self,
+        request: CaptureRequest,
+        cancel_token: Arc<AtomicBool>,
+    ) -> Result<CaptureResponse, ApiError>;
+
     async fn capture(&self, request: CaptureRequest) -> Result<CaptureResponse, ApiError>;
     async fn recover(&self) -> Result<Option<String>, ApiError>;
     async fn camera_model(&self) -> Result<Option<String>, ApiError>;
@@ -40,12 +48,20 @@ impl GphotoBackend {
 
 #[async_trait]
 impl CameraBackend for GphotoBackend {
-    async fn capture(&self, request: CaptureRequest) -> Result<CaptureResponse, ApiError> {
+    async fn capture_with_cancel(
+        &self,
+        request: CaptureRequest,
+        cancel_token: Arc<AtomicBool>,
+    ) -> Result<CaptureResponse, ApiError> {
         let _camera_guard = self
             .camera_lock
             .clone()
             .try_lock_owned()
             .map_err(|_| ApiError::Conflict("camera is busy with another operation".to_string()))?;
+
+        if cancel_token.load(Ordering::SeqCst) {
+            return Err(ApiError::Conflict("capture canceled".to_string()));
+        }
 
         let max_attempts = self.retries.saturating_add(1);
         let mut last_error: Option<ApiError> = None;
@@ -54,9 +70,10 @@ impl CameraBackend for GphotoBackend {
             let capture_dir = self.capture_dir.clone();
             let event_timeout = self.event_timeout;
             let request_clone = request.clone();
+            let cancel_token = cancel_token.clone();
 
             let result = task::spawn_blocking(move || {
-                capture_once(capture_dir, event_timeout, request_clone, attempt)
+                capture_once(capture_dir, event_timeout, request_clone, attempt, cancel_token)
             })
             .await
             .map_err(|_| ApiError::Internal)?;
@@ -72,6 +89,11 @@ impl CameraBackend for GphotoBackend {
         }
 
         Err(last_error.unwrap_or(ApiError::CameraUnavailable))
+    }
+
+    async fn capture(&self, request: CaptureRequest) -> Result<CaptureResponse, ApiError> {
+        self.capture_with_cancel(request, Arc::new(AtomicBool::new(false)))
+            .await
     }
 
     async fn recover(&self) -> Result<Option<String>, ApiError> {
@@ -101,7 +123,12 @@ fn capture_once(
     event_timeout: Duration,
     request: CaptureRequest,
     attempt_count: u8,
+    cancel_token: Arc<AtomicBool>,
 ) -> Result<CaptureResponse, ApiError> {
+    if cancel_token.load(Ordering::SeqCst) {
+        return Err(ApiError::Conflict("capture canceled".to_string()));
+    }
+
     std::fs::create_dir_all(&capture_dir)
         .map_err(|e| ApiError::CaptureFailed(format!("create capture dir failed: {e}")))?;
 
@@ -150,6 +177,7 @@ fn capture_once(
             exposure_seconds,
             &capture_id,
             bulb_wait_deadline,
+            cancel_token,
         )?;
 
         return Ok(CaptureResponse {
@@ -225,6 +253,7 @@ fn capture_bulb_native(
     exposure_seconds: u64,
     capture_id: &str,
     event_timeout: Duration,
+    cancel_token: Arc<AtomicBool>,
 ) -> Result<std::path::PathBuf, ApiError> {
     use gphoto2::camera::CameraEvent;
     use gphoto2::widget::Widget;
@@ -249,22 +278,22 @@ fn capture_bulb_native(
         .wait()
         .map_err(|e| ApiError::CaptureFailed(format!("bulb open failed: {e}")))?;
     println!("Bulb open for {exposure_seconds} seconds...");
-    // Hold for the requested duration
-    thread::sleep(Duration::from_secs(exposure_seconds));
+    // Hold for the requested duration while checking for cancel requests.
+    let exposure_deadline = Duration::from_secs(exposure_seconds);
+    let poll = Duration::from_millis(250);
+    let mut elapsed_exposure = Duration::ZERO;
+    while elapsed_exposure < exposure_deadline {
+        if cancel_token.load(Ordering::SeqCst) {
+            close_bulb(camera)?;
+            return Err(ApiError::Conflict("capture canceled".to_string()));
+        }
+        let remaining = exposure_deadline.saturating_sub(elapsed_exposure);
+        thread::sleep(remaining.min(poll));
+        elapsed_exposure += remaining.min(poll);
+    }
     println!("Bulb close after {exposure_seconds} seconds...");
 
-    // Close shutter: set bulb toggle to 0
-    // Note: D5300 may return an error on set_config(false) even when it works —
-    // ignore the error and proceed to wait for the capture event regardless
-    let widget2 = camera
-        .config_key::<Widget>("bulb")
-        .wait()
-        .map_err(|e| ApiError::CaptureFailed(format!("read bulb config (close) failed: {e}")))?;
-
-    if let Widget::Toggle(ref bulb_close) = widget2 {
-        bulb_close.set_toggled(false);
-        let _ = camera.set_config(bulb_close).wait(); // intentionally ignore error — D5300 known bug
-    }
+    close_bulb(camera)?;
 
     // Drain events until we get a NewFile or CaptureComplete.
     // For long bulb captures this timeout must scale with exposure time.
@@ -274,6 +303,10 @@ fn capture_bulb_native(
     let mut capture_path: Option<(String, String)> = None;
 
     while elapsed < deadline {
+        if cancel_token.load(Ordering::SeqCst) {
+            return Err(ApiError::Conflict("capture canceled".to_string()));
+        }
+
         match camera.wait_event(tick).wait() {
             Ok(CameraEvent::NewFile(path)) => {
                 capture_path = Some((path.folder().to_string(), path.name().to_string()));
@@ -302,6 +335,21 @@ fn capture_bulb_native(
         .map_err(|e| ApiError::CaptureFailed(format!("download failed: {e}")))?;
 
     Ok(output_path)
+}
+
+fn close_bulb(camera: &Camera) -> Result<(), ApiError> {
+    // Note: D5300 may return an error on set_config(false) even when it works.
+    let widget = camera
+        .config_key::<Widget>("bulb")
+        .wait()
+        .map_err(|e| ApiError::CaptureFailed(format!("read bulb config (close) failed: {e}")))?;
+
+    if let Widget::Toggle(ref bulb_close) = widget {
+        bulb_close.set_toggled(false);
+        let _ = camera.set_config(bulb_close).wait();
+    }
+
+    Ok(())
 }
 
 fn set_camera_option(camera: &Camera, key: &str, value: &str) -> Result<(), ApiError> {

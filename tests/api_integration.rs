@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -6,6 +7,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use nikon_bulb_server::build_router;
 use nikon_bulb_server::camera::CameraBackend;
+use nikon_bulb_server::capture_control::CaptureControlStore;
 use nikon_bulb_server::capture_store::CaptureStore;
 use nikon_bulb_server::config::AppConfig;
 use nikon_bulb_server::error::ApiError;
@@ -27,6 +29,14 @@ enum MockMode {
 
 #[async_trait]
 impl CameraBackend for MockBackend {
+    async fn capture_with_cancel(
+        &self,
+        request: CaptureRequest,
+        _cancel_token: Arc<AtomicBool>,
+    ) -> Result<CaptureResponse, ApiError> {
+        self.capture(request).await
+    }
+
     async fn capture(&self, _request: CaptureRequest) -> Result<CaptureResponse, ApiError> {
         match self.mode {
             MockMode::Ok => Ok(CaptureResponse {
@@ -54,9 +64,15 @@ impl CameraBackend for MockBackend {
 fn app_with_mode(mode: MockMode) -> axum::Router {
     let backend: Arc<dyn CameraBackend> = Arc::new(MockBackend { mode });
     let config = AppConfig::from_env();
+    let capture_store = CaptureStore::new(std::env::temp_dir().join(format!(
+        "nikon-bulb-test-{}.db",
+        uuid::Uuid::new_v4()
+    )))
+    .expect("test capture store init");
     let state = AppState {
         backend,
-        capture_store: CaptureStore::new(),
+        capture_store,
+        capture_controls: CaptureControlStore::new(),
         config,
     };
     build_router(state)
